@@ -1,27 +1,35 @@
 from dotenv import load_dotenv
-from groq import Groq
+from openai import OpenAI
 import requests
 import webbrowser
 import os
 import json
+import time
+from rich.console import Console
 from bs4 import BeautifulSoup
 from ddgs import DDGS
 
 load_dotenv()
+console = Console()
 
-client = Groq(api_key = os.getenv("GROQ_API_KEY"))
-
-MODELS = [  
-    "llama-3.3-70b-versatile", 
-    "moonshotai/kimi-k2-instruct",   
-    "openai/gpt-oss-20b",            
-    "openai/gpt-oss-120b",    
-    "llama-3.1-8b-instant",
-    "qwen/qwen3-32b"             
+client = OpenAI(
+    api_key=os.getenv("CEREBRAS_API_KEY"),
+    base_url="https://api.cerebras.ai/v1"
+)
+MODELS = [
+    "qwen-3-235b-a22b-instruct-2507",  
+    "gpt-oss-120b",                     
+    "zai-glm-4.7",                      
+    "llama3.1-8b",
 ]
-
 last_token_used = [0]
 current_model_index = [0]
+
+def get_first_url(search_result: str):
+    for line in search_result.split("\n"):
+        if "Url :" in line:
+            return line.replace("Url :", "").strip()
+    return ""
 
 def get_current_model():
     if current_model_index[0] < len(MODELS):
@@ -47,202 +55,116 @@ def scrape_page(url : str):
         return f"Page Text : \n{text} \n CSS found : \n{css_text}"
     except Exception as e:
         return f"Couldn't scrape : {e}"
-tools = [
-     {
-        "type": "function",
-        "function": {
-            "name": "web_search",
-            "description": "Search the web for UI design examples, CSS patterns, HTML templates and inspiration",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "search query like 'glassmorphism login form CSS'"
-                    }
-                },
-                "required": ["query"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "scrape_page",
-            "description": "Visit a URL and scrape its HTML and CSS code to use as reference",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "url": {
-                        "type": "string",
-                        "description": "the URL to scrape"
-                    }
-                },
-                "required": ["url"]
-            }
-        }
-    }
-]
-
-def run_tools(name , args):
-    if name == "web_search":
-        return web_search(**args)
-    elif name == "scrape_page":
-        return scrape_page(**args)
-    else:
-        return "> Unknown command !"
     
-retry_count = [0]
-def call_api(messages):
+def generate_html(prompt : str, search_data: str, scrape_data : str):
+    model = get_current_model()
+
+    if not model :
+        print("> Models are not available !")
+        return None
+    
+    system = """You are an expert senior UI/UX developer and visual designer with 15 years of experience building production-grade websites.
+
+STRICT RULES:
+- Return ONLY a complete HTML file from <!DOCTYPE html> to </html>
+- No explanation, no markdown, no code blocks, no comments outside HTML
+- All CSS inside <style> tag, all JS inside <script> tag
+
+DESIGN REQUIREMENTS:
+- Use Google Fonts (import via @import url)
+- Use modern CSS: flexbox, grid, animations, transitions, gradients
+- Every button must have hover effects (scale, glow, color change)
+- Every card must have hover effects (lift, shadow, border glow)
+- Navbar must be sticky with blur backdrop-filter effect
+- All sections must have smooth scroll animations
+- Use CSS variables for consistent color theming
+- Add subtle particle or gradient animations in hero section
+- All images must be real Unsplash URLs — never leave image slots empty
+- Every section must be fully filled with real content, no placeholders
+- Fully responsive: mobile, tablet, desktop breakpoints
+
+CONTENT REQUIREMENTS:
+- Use real brand names, real prices, real specifications
+- Use real people names in testimonials
+- Write real, detailed descriptions (not lorem ipsum)
+- Every section must tell a story and feel premium
+
+QUALITY STANDARD:
+- Output must look like it was built by a professional agency
+- Design must match quality of Apple, Tesla, Lamborghini official websites
+- Every pixel must have purpose and intention"""
+
+    user_message = f""" 
+    Create this UI: {prompt}
+    For images use Unsplash URLs like:
+    https://source.unsplash.com/800x500/?{prompt.split()[0]}
+
+
+    IMPORTANT: 
+    - Use real song names, artist names, album names (not placeholders)
+    - Use real emoji icons instead of image placeholders
+    - Make it fully detailed and complete
+
+    Reference data: {search_data[:300]}
+    """
+    console.print(f"[blue]> Generating UI with {model}...[/blue]")
+    
     while current_model_index[0] < len(MODELS):
         model = get_current_model()
-        try:
+        try : 
             response = client.chat.completions.create(
                 model = model,
-                messages = messages,
-                tools = tools,
-                tool_choice = "auto",
-                max_tokens = 8000
+                messages = [
+                    {"role" : "system" , "content" : system},
+                    {"role" : "user" , "content" : user_message}
+                ],
+                max_tokens = 16000,
             )
-
             used = response.usage.total_tokens
-            last_token_used[0] = used
-            print(f"> [{model}] Tokens used this call : {used}")
-            return response
+            print(f"> [{model}] Tokens used: {used}")
+            return response.choices[0].message.content
         except Exception as e:
-            error_msg = str(e).lower()
-
-            if "400" in error_msg or "tool_use_failed" in error_msg:
-                print(f"> [{model}] Tool calling broken ! Switching model....")
-                current_model_index[0] += 1
-                if current_model_index[0] < len(MODELS):
-                    next_model = get_current_model()
-                    print(f"> Switching to : {next_model}")
-                else:
-                    print("> All models are exhausted for today. Try again tomorrow !")
-                    return None
-
-            elif "rate_limit_exceeded" in error_msg or "429" in error_msg:
-                if "per minute" in error_msg or "tpm" in error_msg:
-                    retry_count[0] += 1
-                    if retry_count[0] >= 3:
-                        print(f"> [{model}] Too many retries ! Switching model...")
-                        retry_count[0] = 0
-                        current_model_index[0] += 1
-                        if current_model_index[0] < len(MODELS):
-                            print(f"> Switching to : {get_current_model()}")
-                        else:
-                            print("> all model exhusted !")
-                    else : 
-                        print(f"> [{model}] per-minute limit hit ! Retry {retry_count[0]} Waiting 60 seconds....")
-                        import time
-                        time.sleep(60)
-                        print("> Retrying now......")                 
-                elif "per day" in error_msg or "tpd" in error_msg:
-                    print(f"> [{model}] Daily limit hit ! Switching model....")
-                    current_model_index[0] += 1
-
-                    if current_model_index[0] < len(MODELS):
-                        print(f"> Switching to : {get_current_model()} !")
-                    else : 
-                        print("> All models are exhausted for today. Try again tomorrow !")
-                        return None  
-
-                else :
-                    print(f"> [{model}] Rate limit hit ! Waiting for 30 seconds.....")
-                    import time
-                    time.sleep(30)
-            else:
-                print(f"> API Error : {e}")
-                raise
-
+            console.print(f"[yellow]> Switching from {model} due to: {e}[/yellow]")
+            current_model_index[0] += 1
+    
     return None
 
+def save_open(html : str):
+    if "<!DOCTYPE html>" in html:
+        start = html.find("<!DOCTYPE html>")
+        end = html.rfind("</html>")
+
+        if start != -1 and end != -1:
+            html = html[start : end + 7]
+            os.makedirs("outputs" , exist_ok = True)
+            with open("outputs/output.html" , "w" , encoding = "utf-8") as f:
+                f.write(html)
+
+            path = os.path.abspath("outputs/output.html").replace("\\", "/")
+            webbrowser.open(f"file:///{path}")
+            print("> Saved and opened !")
+            return
+    print("> Warning : Could not extract valid HTML.")
+
+while True:
+    current_model_index[0] = 0
+
+    print(f"\n> Active model: {get_current_model()}")
+    print("> Enter a prompt to make an absolute UI!")
+    prompt = input("> You : ")
+
+    if prompt.lower() == 'exit':
+        print("> Bye !")
+        break
     
-def run_conversation(prompt , messages):
-    messages.append({"role" : "user" , "content" : prompt})
 
-    while True:
-        response = call_api(messages) 
+    search_result = web_search(prompt + " UI design HTML CSS JS")
+    skip_scrape = any(w in prompt.lower() for w in ['website' , 'landing', 'dealership', 'portfolio' , 'clone'])
+    url = get_first_url(search_result)
+    scraped_data = "Be creative , no reference needed." if skip_scrape else (scrape_page(url) if url else "No URL found ")
+    html = generate_html(prompt, search_result, scraped_data)
 
-        if response is None:
-            print("> Could not get a response. All models are at their limit.")
-            break
-        message = response.choices[0].message
-
-        if not message.tool_calls:
-            print(f"> AI : {message.content}")
-
-            if "<!DOCTYPE html>" in message.content:
-                start = message.content.find("<!DOCTYPE html")
-                end = message.content.rfind("</html>")
-
-                if start != -1 and end != -1 :
-                    html = message.content[start : end + 7]
-                    os.makedirs("outputs" , exist_ok = True)
-                    with open("outputs/output.html", "w" , encoding = "utf-8") as f:
-                        f.write(html)
-                    path = os.path.abspath("outputs/output.html").replace("\\" , "/")
-                    webbrowser.open(f"file:///{path}")
-                    print("> Saved and Opened !")
-                else : 
-                    print("> Warning: Could not extract valid HTML from response.")
-            break
-
-        messages.append(message)
-
-        chat_history = []
-        for tool_call in message.tool_calls:
-            try:
-                name = tool_call.function.name
-                args = json.loads(tool_call.function.arguments)
-
-                result = run_tools(name, args)
-                print(f"Tool {name} calling........")
-
-                chat_history.append({
-                    "role" : "tool",
-                    "tool_call_id" : tool_call.id,
-                    "content" : str(result)
-                })
-            except Exception as e : 
-                print(f"Error : {e}")
-
-                chat_history.append({
-                    "role" : "tool",
-                    "tool_call_id" : tool_call.id,
-                    "content" : f"Error : {e}"
-                })
-        for r in chat_history:
-            messages.append(r)
-
-
-# while True:
-    # print(f"> Active model : {get_current_model()}")
-    # print("> Enter a prompt to make an absoluate UI !")
-    # prompt = input("> You : ")
-
-    # if prompt.lower() == "exit":
-        # print("> BYE !")
-        # break
-
-    # if current_model_index[0] >= len(MODELS):
-        # print("> All models are exhausted. Come back tomorrow !")
-        # break
-    
-    # messages = [
-        #   {
-        # "role": "system",
-        # "content": """You are an expert UI developer.
-# Follow these steps in order:
-# 1. Call web_search ONCE to find UI examples
-# 2. Call scrape_page ONCE on the best URL from results
-# 3. After getting results, return ONLY the complete HTML file in your response
-# 4. HTML must start with <!DOCTYPE html> and end with </html>
-# 5. All CSS inside <style> tag, all JS inside <script> tag
-# 6. Do NOT call any other tools
-# 7. Do NOT ask any questions
-# 8. Do NOT add any explanation before or after the HTML"""
-        # }
-    # ]
-    # run_conversation(prompt, messages)
+    if html:
+        save_open(html)
+    else : 
+        print("> Failed to generate UI ")
