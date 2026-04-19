@@ -1,4 +1,4 @@
-# GEN-UI 🎨
+﻿# GEN-UI 🎨
 > AI-powered UI generator that creates production-grade HTML, CSS, JS interfaces from a single line prompt
 
 [![PyPI version](https://badge.fury.io/py/genui-ai.svg)](https://badge.fury.io/py/genui-ai)
